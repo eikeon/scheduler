@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"container/heap"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -64,11 +66,18 @@ func (e *Event) duration() time.Duration {
 
 func (e *Event) next() time.Time {
 	duration := e.duration()
-	wait := time.Duration((e.on.UnixNano() - time.Now().UnixNano()) % int64(duration))
-	if wait < 0 {
-		wait += duration
+	t := e.on
+	for {
+		wait := time.Duration(t.UnixNano() - time.Now().UnixNano())
+		if wait > 0 {
+			break
+		}
+		if e.Interval == "" || e.Interval == "daily" {
+			t = t.AddDate(0, 0, 1)
+		} else {
+			t = t.Add(duration)
+		}
 	}
-	t := time.Now().Add(wait)
 	log.Println("next '" + e.What + "' on: " + t.String())
 	return t
 }
@@ -118,48 +127,92 @@ type Schedule []*Event
 
 func (s Schedule) Run() (chan Event, error) {
 	eventsCh := make(chan Event, 1)
+	sr := Scheduler{}
+	sr.Run()
+	sr.In <- s
+	go func() {
+		for e := range sr.Out {
+			eventsCh <- e
+		}
+	}()
+	return eventsCh, nil
+}
+
+type Scheduler struct {
+	In  chan<- Schedule
+	Out <-chan Event
+	pq  *EventQueue
+}
+
+func (scheduler *Scheduler) String() string {
+	var terms []string
+	pq := *scheduler.pq
+	for i := 0; i < len(pq); i++ {
+		terms = append(terms, fmt.Sprintf("%s %s", pq[i].When, pq[i].What))
+	}
+	return strings.Join(terms, "\n")
+}
+
+func (s *Scheduler) Run() {
+	in := make(chan Schedule, 10)
+	out := make(chan Event, 10)
+	s.In = in
+	s.Out = out
 
 	pq := &EventQueue{}
+	s.pq = pq
 	heap.Init(pq)
 
-	now := time.Now()
-	zone, _ := now.Zone()
+	timer := time.NewTimer(time.Hour)
+	go func() {
+		for {
+			log.Println("loop")
+			select {
+			case sc := <-in:
+				pq = &EventQueue{}
+				s.pq = pq
+				heap.Init(pq)
 
-	for _, e := range s {
-		if on, err := time.Parse("2006-01-02 "+time.Kitchen+" MST", now.Format("2006-01-02 ")+e.When+" "+zone); err != nil {
-			log.Println("could not parse when of '" + e.When + "' for " + e.What)
-			continue
-		} else {
-			e.on = on
-		}
+				for _, e := range sc {
+					log.Println("got:", e)
+					now := time.Now()
+					zone, _ := now.Zone()
 
-		t := e.next()
-		heap.Push(pq, &QueueItem{Event: e, timestamp: t.UnixNano()})
-	}
+					if on, err := time.Parse("2006-01-02 "+time.Kitchen+" MST", now.Format("2006-01-02 ")+e.When+" "+zone); err != nil {
+						log.Println("could not parse when of '" + e.When + "' for " + e.What)
+					} else {
+						e.on = on
+					}
 
-	go func(pq *EventQueue) {
-		for pq.Len() > 0 {
-			item := heap.Pop(pq).(*QueueItem)
-			now := time.Now()
-			d := time.Duration(item.timestamp - now.UnixNano())
-			if d < 0 {
-				if item.shouldRun(now) {
-					log.Println(item.What + " at " + now.String())
-					item.time = now
-					eventsCh <- *item.Event
+					t := e.next()
+					heap.Push(pq, &QueueItem{Event: e, timestamp: t.UnixNano()})
 				}
-				item.timestamp = item.next().UnixNano()
-				heap.Push(pq, item)
-			} else {
-				heap.Push(pq, item)
-				if d < time.Second {
-					time.Sleep(d)
+				timer.Reset(0)
+			case <-timer.C:
+				log.Println("tick")
+				if pq.Len() > 0 {
+					item := heap.Pop(pq).(*QueueItem)
+					now := time.Now()
+					d := time.Duration(item.timestamp - now.UnixNano())
+					log.Println("item: ", item, "d: ", d)
+					if d <= 0 {
+						if item.shouldRun(now) {
+							log.Println(item.What + " at " + now.String())
+							item.time = now
+							out <- *item.Event
+						}
+						item.timestamp = item.next().UnixNano()
+						heap.Push(pq, item)
+						timer.Reset(0)
+					} else {
+						heap.Push(pq, item)
+						timer.Reset(d)
+					}
 				} else {
-					time.Sleep(time.Second)
+					timer.Reset(time.Hour)
 				}
 			}
 		}
-	}(pq)
-
-	return eventsCh, nil
+	}()
+	return
 }
